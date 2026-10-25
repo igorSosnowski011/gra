@@ -1,0 +1,427 @@
+
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NOCNA ZMIANA — Horror</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#05070a;color:#eee;font:15px Arial;overflow:hidden}
+canvas{display:block}
+#hud{position:fixed;inset:0;pointer-events:none;text-shadow:0 2px 8px #000}
+#top{position:absolute;top:15px;left:18px;right:18px;display:flex;justify-content:space-between}
+.chip,#mission,#hint{background:#080b10d9;border:1px solid #424955;border-radius:8px;padding:12px}
+.brand{font-weight:bold;letter-spacing:3px}
+.brand span{color:#e43b45}
+#mission{position:absolute;top:80px;left:18px;line-height:1.8}
+#cross{position:absolute;left:50%;top:50%;width:6px;height:6px;border:1px solid white;border-radius:50%}
+#hint{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);white-space:nowrap}
+#overlay{position:fixed;inset:0;z-index:5;display:flex;align-items:center;justify-content:center;background:#020408ee;padding:20px}
+.panel{width:min(650px,100%);background:#10141b;border:1px solid #454b55;border-radius:14px;padding:25px}
+h1{font-size:clamp(32px,7vw,56px);margin:12px 0}
+h1 span{color:#e43b45}
+p{color:#b8c0ca;line-height:1.6}
+label{display:block;margin:12px 0;color:#bac2ce}
+input,select{display:block;width:100%;padding:11px;background:#080b10;color:white;border:1px solid #454b55;border-radius:6px;margin-top:6px}
+button{background:#b92d38;color:white;padding:12px 17px;border:0;border-radius:6px;font-weight:bold;cursor:pointer;margin:5px 5px 5px 0}
+button.secondary{background:#303640}
+.hidden{display:none!important}
+#toast{position:fixed;bottom:70px;left:50%;transform:translateX(-50%);background:#161b22;padding:12px;border-radius:8px;display:none;z-index:10}
+#alert{position:absolute;top:30%;left:50%;transform:translateX(-50%);color:#ff3947;font-weight:bold;font-size:28px;opacity:0}
+#alert.show{opacity:1}
+#players{position:fixed;right:18px;top:85px;pointer-events:none}
+@media(max-width:600px){#hint{white-space:normal;width:90%;text-align:center}#mission{top:90px}}
+</style>
+</head>
+<body>
+<div id="hud">
+ <div id="top">
+  <div class="chip"><div class="brand">NOCNA <span>ZMIANA</span></div>OBIEKT 09 · NOC 01</div>
+  <div class="chip">SANITY: <b id="sanity">100</b>%<br><span id="roomStatus">SOLO</span></div>
+ </div>
+ <div id="mission">
+  <b>CELE ZMIANY</b><br>
+  <span id="missionList">□ Znajdź bezpiecznik<br>□ Włącz zasilanie<br>□ Zbierz próbki: 0/3<br>□ Uciekaj</span>
+ </div>
+ <div id="cross"></div>
+ <div id="alert">NIE JESTEŚ SAM</div>
+ <div id="hint">WASD — ruch · Mysz — kamera · F — latarka · E — interakcja · Shift — sprint</div>
+</div>
+<div id="players"></div>
+<div id="toast"></div>
+<div id="overlay">
+ <div class="panel">
+  <small>KOOPERACYJNY SURVIVAL HORROR</small>
+  <h1>NOCNA <span>ZMIANA</span></h1>
+  <p>Opuszczony ośrodek. Znajdź bezpiecznik, przywróć zasilanie, zbierz próbki i uciekaj przed potworem.</p>
+  <label>Twój nick<input id="nick" value="Gracz" maxlength="16"></label>
+  <label>Grafika
+   <select id="quality">
+    <option value="high">Wysoka</option>
+    <option value="medium">Średnia</option>
+    <option value="low">Wydajność</option>
+   </select>
+  </label>
+  <label>Jasność<input id="brightness" type="range" min="50" max="150" value="100"></label>
+  <label>Kod pokoju (multiplayer)<input id="room" placeholder="Np. NOC-123"></label>
+  <label>Tryb
+   <select id="role">
+    <option value="host">Stwórz pokój</option>
+    <option value="join">Dołącz do pokoju</option>
+   </select>
+  </label>
+  <button id="play">WEJDŹ DO GRY</button>
+  <button id="help" class="secondary">JAK GRAĆ?</button>
+  <p>Multiplayer wymaga połączenia internetowego. To prototyp gry.</p>
+ </div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+(()=>{
+const $=id=>document.getElementById(id);
+let scene,camera,renderer,clock,player,monster,flashLight;
+let keys={},yaw=0,pitch=0,locked=false,started=false,flash=true;
+let sanity=100,health=100,world=[],items=[],lastNet=0;
+let peer=null,connections=[],hostConn=null,players={},isHost=true;
+let roomId='',completed={fuse:false,power:false,samples:0,exit:false};
+
+function toast(msg){
+ $('toast').textContent=msg;
+ $('toast').style.display='block';
+ setTimeout(()=>{$('toast').style.display='none'},2500);
+}
+function missions(){
+ $('missionList').innerHTML=
+ `${completed.fuse?'☑':'□'} Znajdź bezpiecznik<br>`+
+ `${completed.power?'☑':'□'} Włącz zasilanie<br>`+
+ `${completed.samples>=3?'☑':'□'} Zbierz próbki: ${completed.samples}/3<br>`+
+ `${completed.exit?'☑':'□'} Uciekaj`;
+}
+function box(x,y,z,w,h,d,material,collide=true){
+ const mesh=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),material);
+ mesh.position.set(x,y,z);
+ mesh.castShadow=true;
+ mesh.receiveShadow=true;
+ scene.add(mesh);
+ if(collide)world.push({x,z,w,d});
+ return mesh;
+}
+function collides(x,z){
+ for(const w of world){
+  if(Math.abs(x-w.x)<w.w/2+.3 &&
+     Math.abs(z-w.z)<w.d/2+.3)return true;
+ }
+ return false;
+}
+function addItem(type,x,z,color){
+ const group=new THREE.Group();
+ const mat=new THREE.MeshStandardMaterial({
+  color,emissive:color,emissiveIntensity:.3
+ });
+ group.add(new THREE.Mesh(new THREE.BoxGeometry(.65,.65,.65),mat));
+ const light=new THREE.PointLight(color,1.5,4);
+ light.position.y=.7;
+ group.add(light);
+ group.position.set(x,.7,z);
+ scene.add(group);
+ items.push({type,group,used:false});
+}
+function init(){
+ scene=new THREE.Scene();
+ scene.background=new THREE.Color(0x030609);
+ scene.fog=new THREE.FogExp2(0x080b10,.035);
+
+ camera=new THREE.PerspectiveCamera(76,innerWidth/innerHeight,.08,100);
+ renderer=new THREE.WebGLRenderer({antialias:$('quality').value!=='low'});
+ renderer.setSize(innerWidth,innerHeight);
+ renderer.setPixelRatio(Math.min(devicePixelRatio,$('quality').value==='high'?1.5:1));
+ renderer.shadowMap.enabled=$('quality').value==='high';
+ renderer.toneMapping=THREE.ACESFilmicToneMapping;
+ document.body.appendChild(renderer.domElement);
+ renderer.domElement.tabIndex=0;
+
+ clock=new THREE.Clock();
+ scene.add(new THREE.HemisphereLight(0x9da9bd,0x101116,.4));
+
+ const floorMat=new THREE.MeshStandardMaterial({color:0x252a30});
+ const wallMat=new THREE.MeshStandardMaterial({color:0x30343a});
+ const floor=new THREE.Mesh(new THREE.PlaneGeometry(48,48),floorMat);
+ floor.rotation.x=-Math.PI/2;
+ floor.receiveShadow=true;
+ scene.add(floor);
+
+ for(let i=-24;i<=24;i+=4){
+  box(i,2,-24,.25,4,48,wallMat);
+  box(i,2,24,.25,4,48,wallMat);
+  box(-24,2,i,48,4,.25,wallMat);
+  box(24,2,i,48,4,.25,wallMat);
+ }
+ const walls=[
+  [-9,0,1,28],[9,0,1,28],[0,-8,18,1],
+  [0,9,18,1],[-16,0,1,18],[16,0,1,18],
+  [-14,-12,14,1],[14,12,14,1],
+  [-5,15,1,12],[7,-15,1,12],
+  [-14,6,8,1],[14,-6,8,1]
+ ];
+ walls.forEach(a=>box(a[0],2,a[1],a[2],4,a[3],wallMat));
+
+ for(let i=0;i<10;i++){
+  const x=Math.random()*38-19,z=Math.random()*38-19;
+  const light=new THREE.PointLight(i%3===0?0xff2337:0x7896b8,.8,8);
+  light.position.set(x,3,z);
+  scene.add(light);
+ }
+ addItem('fuse',-15,-15,0xffbb54);
+ addItem('sample',14,-15,0x55e8a3);
+ addItem('sample',-17,14,0x55e8a3);
+ addItem('sample',17,16,0x55e8a3);
+ addItem('panel',0,-19,0x62aaff);
+
+ const doorMat=new THREE.MeshStandardMaterial({color:0x661d25,emissive:0x280509});
+ box(0,1.7,21.7,3.5,3.4,.4,doorMat,false);
+
+ monster=new THREE.Group();
+ const body=new THREE.Mesh(
+  new THREE.CapsuleGeometry(.48,1.3,4,8),
+  new THREE.MeshStandardMaterial({color:0x08090c})
+ );
+ body.position.y=1.15;
+ monster.add(body);
+ const head=new THREE.Mesh(
+  new THREE.SphereGeometry(.38,12,10),
+  new THREE.MeshStandardMaterial({color:0x0a080a})
+ );
+ head.position.y=2.1;
+ monster.add(head);
+ for(const x of [-.14,.14]){
+  const eye=new THREE.Mesh(
+   new THREE.SphereGeometry(.055,8,8),
+   new THREE.MeshBasicMaterial({color:0xff1825})
+  );
+  eye.position.set(x,2.13,-.34);
+  monster.add(eye);
+ }
+ monster.position.set(0,0,-18);
+ scene.add(monster);
+
+ flashLight=new THREE.SpotLight(0xdbe7ff,45,24,Math.PI/7,.48,1.3);
+ camera.add(flashLight);
+ flashLight.target.position.set(0,0,-1);
+ camera.add(flashLight.target);
+ scene.add(camera);
+
+ player={x:0,z:7};
+ camera.position.set(0,1.7,7);
+
+ window.addEventListener('resize',resize);
+
+ // KLAWIATURA: działa także bez blokady kursora.
+ function setKey(e,value){
+  keys[e.code]=value;
+  if(e.key)keys['key:'+e.key.toLowerCase()]=value;
+ }
+ window.addEventListener('keydown',e=>{
+  if(!started)return;
+  if(['KeyW','KeyA','KeyS','KeyD','ArrowUp','ArrowDown',
+      'ArrowLeft','ArrowRight','ShiftLeft','ShiftRight'].includes(e.code)){
+   e.preventDefault();
+  }
+  setKey(e,true);
+  if(e.code==='KeyF'&&!e.repeat){
+   flash=!flash;
+   flashLight.intensity=flash?45:0;
+   toast(flash?'Latarka włączona':'Latarka wyłączona');
+  }
+  if(e.code==='KeyE'&&!e.repeat)interact();
+  if(e.code==='Escape'&&locked)document.exitPointerLock();
+ },{passive:false});
+ window.addEventListener('keyup',e=>setKey(e,false));
+ window.addEventListener('blur',()=>{keys={};});
+
+ // KAMERA: Pointer Lock plus tryb awaryjny myszy.
+ renderer.domElement.addEventListener('click',()=>{
+  if(!started)return;
+  renderer.domElement.focus();
+  if(renderer.domElement.requestPointerLock){
+   const result=renderer.domElement.requestPointerLock();
+   if(result&&result.catch)result.catch(()=>{});
+  }
+ });
+ document.addEventListener('pointerlockchange',()=>{
+  locked=document.pointerLockElement===renderer.domElement;
+ });
+
+ let mouseDown=false,lastX=0,lastY=0;
+ renderer.domElement.addEventListener('mousedown',e=>{
+  if(!started)return;
+  mouseDown=true;lastX=e.clientX;lastY=e.clientY;
+ });
+ window.addEventListener('mouseup',()=>mouseDown=false);
+ document.addEventListener('mousemove',e=>{
+  if(!started)return;
+  let mx=0,my=0;
+  if(locked){mx=e.movementX||0;my=e.movementY||0;}
+  else if(mouseDown){
+   mx=e.clientX-lastX;my=e.clientY-lastY;
+   lastX=e.clientX;lastY=e.clientY;
+  }else return;
+  yaw-=mx*.0022;
+  pitch-=my*.0022;
+  pitch=Math.max(-1.35,Math.min(1.35,pitch));
+  camera.rotation.order='YXZ';
+  camera.rotation.set(pitch,yaw,0);
+ });
+
+ animate();
+}
+function resize(){
+ if(!camera)return;
+ camera.aspect=innerWidth/innerHeight;
+ camera.updateProjectionMatrix();
+ renderer.setSize(innerWidth,innerHeight);
+}
+function interact(){
+ let target=null,dist=2.8;
+ for(const it of items){
+  if(it.used)continue;
+  const d=it.group.position.distanceTo(camera.position);
+  if(d<dist){dist=d;target=it;}
+ }
+ if(target){
+  if(target.type==='panel'&&!completed.fuse){
+   toast('Najpierw znajdź bezpiecznik!');
+   return;
+  }
+  target.used=true;
+  target.group.visible=false;
+  if(target.type==='fuse'){
+   completed.fuse=true;
+   toast('Bezpiecznik znaleziony!');
+  }
+  if(target.type==='panel'){
+   completed.power=true;
+   toast('Zasilanie przywrócone!');
+  }
+  if(target.type==='sample'){
+   completed.samples++;
+   toast('Zebrano próbkę!');
+  }
+  missions();
+  return;
+ }
+ if(Math.hypot(player.x,player.z-20)<4){
+  if(completed.power&&completed.samples>=3){
+   completed.exit=true;missions();
+   toast('UCIECZKA! Udało wam się!');
+  }else toast('Potrzebujesz zasilania i 3 próbek.');
+ }else toast('Podejdź bliżej do przedmiotu.');
+}
+function animate(){
+ requestAnimationFrame(animate);
+ if(!started)return;
+ const dt=Math.min(clock.getDelta(),.05);
+ const speed=(keys.ShiftLeft||keys.ShiftRight)?5.4:3.25;
+ let dx=0,dz=0;
+ if(keys.KeyW||keys.ArrowUp||keys['key:w'])dz-=1;
+ if(keys.KeyS||keys.ArrowDown||keys['key:s'])dz+=1;
+ if(keys.KeyA||keys.ArrowLeft||keys['key:a'])dx-=1;
+ if(keys.KeyD||keys.ArrowRight||keys['key:d'])dx+=1;
+ const len=Math.hypot(dx,dz)||1;
+ dx/=len;dz/=len;
+ const moveX=(dx*Math.cos(yaw)+dz*Math.sin(yaw))*speed*dt;
+ const moveZ=(-dx*Math.sin(yaw)+dz*Math.cos(yaw))*speed*dt;
+ const nx=player.x+moveX,nz=player.z+moveZ;
+
+ if(!collides(nx,player.z))player.x=nx;
+ if(!collides(player.x,nz))player.z=nz;
+ camera.position.set(player.x,1.7,player.z);
+
+ const mx=player.x-monster.position.x;
+ const mz=player.z-monster.position.z;
+ const md=Math.hypot(mx,mz);
+ const ms=completed.power?1.55:1.05;
+ if(md>1.25){
+  monster.position.x+=mx/md*ms*dt;
+  monster.position.z+=mz/md*ms*dt;
+ }
+ monster.lookAt(player.x,1,player.z);
+ if(md<5){
+  sanity=Math.max(0,sanity-dt*(md<2?5:1.8));
+  $('alert').classList.add('show');
+ }else{
+  $('alert').classList.remove('show');
+  sanity=Math.min(100,sanity+dt*.7);
+ }
+ $('sanity').textContent=Math.round(sanity);
+ for(const it of items){
+  if(!it.used){
+   it.group.rotation.y+=dt*.7;
+   it.group.position.y=.7+Math.sin(performance.now()*.002+it.group.position.x)*.12;
+  }
+ }
+ renderer.render(scene,camera);
+}
+function connect(){
+ if(!window.Peer){toast('Brak biblioteki multiplayer');return;}
+ roomId=($('room').value.trim()||('NOC-'+Math.floor(100+Math.random()*900))).toUpperCase();
+ $('room').value=roomId;
+ isHost=$('role').value==='host';
+ const id='nocna-'+roomId.toLowerCase();
+ peer=new Peer(isHost?id:undefined);
+ peer.on('open',()=>{
+  if(isHost){
+   $('roomStatus').textContent='Pokój: '+roomId;
+   toast('Pokój utworzony: '+roomId);
+  }else{
+   hostConn=peer.connect(id,{reliable:true});
+   hostConn.on('open',()=>toast('Połączono z hostem'));
+   wire(hostConn);
+  }
+ });
+ peer.on('connection',conn=>{
+  if(!isHost){conn.close();return;}
+  if(connections.length>=4){conn.close();return;}
+  connections.push(conn);wire(conn);
+ });
+ peer.on('error',err=>{
+  console.warn(err);
+  toast('Błąd połączenia: '+err.type);
+ });
+}
+function wire(conn){
+ conn.on('data',data=>{
+  if(data.t==='state'){
+   players[conn.peer]=data;
+   $('players').textContent='Połączonych graczy: '+(Object.keys(players).length+1);
+   if(isHost)connections.forEach(c=>{if(c!==conn)c.send(data);});
+  }
+ });
+ conn.on('close',()=>{
+  connections=connections.filter(c=>c!==conn);
+  delete players[conn.peer];
+ });
+}
+$('play').addEventListener('click',()=>{
+ if(started)return;
+ started=true;
+ $('overlay').classList.add('hidden');
+ try{
+  init();
+  connect();
+ }catch(err){
+  console.error(err);
+  toast('Błąd grafiki. Odśwież stronę i spróbuj ponownie.');
+ }
+});
+$('help').addEventListener('click',()=>{
+ alert('WASD — ruch. Mysz — kamera. F — latarka. E — interakcja. Shift — sprint. Znajdź bezpiecznik, włącz panel, zbierz trzy próbki i uciekaj.');
+});
+$('brightness').addEventListener('input',e=>{
+ document.body.style.filter=`brightness(${e.target.value/100})`;
+});
+})();
+</script>
+</body>
+</html>
